@@ -28,6 +28,9 @@ from google.genai.types import (
     Tool,
     GenerationConfig,
     AudioTranscriptionConfig,
+    ContextWindowCompressionConfig,
+    SlidingWindow,
+    SessionResumptionConfig,
 )
 
 load_dotenv()
@@ -81,6 +84,8 @@ class GeminiLiveConfig:
     response_modalities: List[Modality] | None = field(default_factory=lambda: ["TEXT", "AUDIO"])
     input_audio_transcription: AudioTranscriptionConfig | None = field(default_factory=dict)
     output_audio_transcription: AudioTranscriptionConfig | None = field(default_factory=dict)
+    context_window_compression: ContextWindowCompressionConfig | None = None
+    session_resumption: SessionResumptionConfig | None = None
 
 @dataclass
 class GeminiSession:
@@ -100,6 +105,7 @@ class GeminiRealtime(RealtimeBaseModel[GeminiEventTypes]):
         api_key: str | None = None,
         service_account_path: str | None = None,
     ) -> None:
+        print("creating a new GeminiRealtime")
         """
         Initialize Gemini realtime model.
         
@@ -141,6 +147,8 @@ class GeminiRealtime(RealtimeBaseModel[GeminiEventTypes]):
         self.config: GeminiLiveConfig = config or GeminiLiveConfig()
         self.target_sample_rate = 24000
         self.input_sample_rate = 48000
+        self._session_handle: Optional[str] = None  # Store the session handle for resumption
+        self.formatted_tools = None  # Initialize formatted_tools
 
 
     def set_agent(self, agent: Agent) -> None:
@@ -164,6 +172,8 @@ class GeminiRealtime(RealtimeBaseModel[GeminiEventTypes]):
     
     async def connect(self) -> None:
         """Connect to the Gemini Live API"""
+        logger.info(f"[SESSION] Starting connection. Current session handle: {self._session_handle[:20] if self._session_handle else 'None'}")
+        
         if self._session:
             await self._cleanup_session(self._session)
             self._session = None
@@ -183,6 +193,7 @@ class GeminiRealtime(RealtimeBaseModel[GeminiEventTypes]):
                 initial_session = await self._create_session()
                 if initial_session:
                     self._session = initial_session
+                    logger.info("[SESSION] Initial session created successfully")
             except Exception as e:
                 logger.error(f"Initial session creation failed, will retry: {e}")
             
@@ -195,7 +206,21 @@ class GeminiRealtime(RealtimeBaseModel[GeminiEventTypes]):
             raise
     
     async def _create_session(self) -> GeminiSession:
+        print("_create_session", self._session_handle, self.config.session_resumption)
         """Create a new Gemini Live API session"""
+        # Use the stored session handle if available for resumption
+        session_resumption_config = None
+        if self._session_handle:
+            logger.info(f"[SESSION] RESUMING session with stored handle: {self._session_handle[:50]}...")
+            session_resumption_config = SessionResumptionConfig(handle=self._session_handle)
+        elif self.config.session_resumption and hasattr(self.config.session_resumption, 'handle') and self.config.session_resumption.handle:
+            logger.info(f"[SESSION] Using config's session handle: {self.config.session_resumption.handle[:50]}...")
+            session_resumption_config = self.config.session_resumption
+        else:
+            logger.info("[SESSION] Creating NEW session (no handle available)")
+            # Create new session resumption config without handle for new sessions
+            session_resumption_config = SessionResumptionConfig()
+        
         config = LiveConnectConfig(
             response_modalities=self.config.response_modalities,
             generation_config=GenerationConfig(
@@ -216,14 +241,18 @@ class GeminiRealtime(RealtimeBaseModel[GeminiEventTypes]):
             ),
             tools=self.formatted_tools or None,
             input_audio_transcription=self.config.input_audio_transcription,
-            output_audio_transcription=self.config.output_audio_transcription
+            output_audio_transcription=self.config.output_audio_transcription,
+            context_window_compression=self.config.context_window_compression,
+            session_resumption=session_resumption_config,
         )
         try:
+            logger.info(f"[SESSION] Attempting to connect with model: {self.model}")
             session_cm = self.client.aio.live.connect(model=self.model, config=config)
             session = await session_cm.__aenter__()
+            logger.info("[SESSION] Successfully connected to Gemini Live API")
             return GeminiSession(session=session, session_cm=session_cm, tasks=[])
         except Exception as e:
-            logger.error(f"Connection error: {e}")
+            logger.error(f"[SESSION] Connection error: {e}")
             traceback.print_exc()
             raise
     
@@ -233,19 +262,24 @@ class GeminiRealtime(RealtimeBaseModel[GeminiEventTypes]):
         max_reconnect_attempts = 5
         reconnect_delay = 1
         
+        logger.info("[SESSION_LOOP] Starting main session loop")
+        
         while not self._closing:
             if not self._session:
                 try:
+                    logger.info(f"[SESSION_LOOP] Creating session (attempt {reconnect_attempts + 1})")
                     self._session = await self._create_session()
                     reconnect_attempts = 0
                     reconnect_delay = 1
+                    logger.info("[SESSION_LOOP] Session created successfully")
                 except Exception as e:
                     reconnect_attempts += 1
                     reconnect_delay = min(30, reconnect_delay * 2)
-                    logger.error(f"Session creation attempt {reconnect_attempts} failed: {e}")
+                    logger.error(f"[SESSION_LOOP] Session creation attempt {reconnect_attempts} failed: {e}")
                     if reconnect_attempts >= max_reconnect_attempts:
-                        logger.error("Max reconnection attempts reached")
+                        logger.error("[SESSION_LOOP] Max reconnection attempts reached")
                         break
+                    logger.info(f"[SESSION_LOOP] Waiting {reconnect_delay}s before retry...")
                     await asyncio.sleep(reconnect_delay)
                     continue
             
@@ -267,10 +301,12 @@ class GeminiRealtime(RealtimeBaseModel[GeminiEventTypes]):
                     logger.error(f"Error during task cleanup: {e}")
             
             if not self._closing:
+                logger.info(f"[SESSION_LOOP] Session ended, preparing to reconnect. Current handle: {self._session_handle[:20] if self._session_handle else 'None'}")
                 await self._cleanup_session(session)
                 self._session = None
                 await asyncio.sleep(reconnect_delay)
                 self._session_should_close.clear()
+                logger.info("[SESSION_LOOP] Ready for reconnection")
     
     async def _handle_tool_calls(self, response, active_response_id: str) -> None:
         """Handle tool calls from Gemini"""
@@ -313,6 +349,22 @@ class GeminiRealtime(RealtimeBaseModel[GeminiEventTypes]):
                         
                         if response.tool_call:
                             await self._handle_tool_calls(response, active_response_id)
+                        
+                        # Check for session_resumption_update first (outside server_content)
+                        print("response.session_resumption_update", response.session_resumption_update)
+                        if hasattr(response, 'session_resumption_update'):
+                            if (session_resumption_update := response.session_resumption_update):
+                                logger.info(f"[RESUMPTION] Received session_resumption_update (from response): resumable={session_resumption_update.resumable if hasattr(session_resumption_update, 'resumable') else 'N/A'}, has_handle={bool(getattr(session_resumption_update, 'new_handle', None))}")
+                                if hasattr(session_resumption_update, 'resumable') and session_resumption_update.resumable and hasattr(session_resumption_update, 'new_handle') and session_resumption_update.new_handle:
+                                    # Store the session handle for future reconnections
+                                    old_handle = self._session_handle
+                                    self._session_handle = session_resumption_update.new_handle
+                                    logger.info(f"[RESUMPTION] STORED new session handle: {self._session_handle[:50]}...")
+                                    logger.info(f"[RESUMPTION] Previous handle was: {old_handle[:50] if old_handle else 'None'}")
+                                    # Also update config if it exists
+                                    if self.config.session_resumption:
+                                        self.config.session_resumption.handle = session_resumption_update.new_handle
+                                        logger.info("[RESUMPTION] Updated config.session_resumption.handle")
                         
                         if (server_content := response.server_content):
                             try:
@@ -381,9 +433,12 @@ class GeminiRealtime(RealtimeBaseModel[GeminiEventTypes]):
                 
                 except Exception as e:
                     if "1000 (OK)" in str(e):
-                        logger.info("Normal WebSocket closure")
+                        logger.info("[RECEIVE] Normal WebSocket closure")
+                    elif "1011" in str(e) and "internal error" in str(e):
+                        logger.error(f"[RECEIVE] Internal service error (likely timeout): {e}")
+                        logger.info(f"[RECEIVE] Session handle at disconnect: {self._session_handle[:50] if self._session_handle else 'None'}")
                     else:
-                        logger.error(f"Error in receive loop: {e}")
+                        logger.error(f"[RECEIVE] Error in receive loop: {e}")
                         traceback.print_exc()
                     
                     self._session_should_close.set()
@@ -528,14 +583,21 @@ class GeminiRealtime(RealtimeBaseModel[GeminiEventTypes]):
     
     async def _cleanup_session(self, session: GeminiSession) -> None:
         """Clean up a session's resources"""
+        logger.info(f"[CLEANUP] Cleaning up session. Preserving handle: {self._session_handle[:20] if self._session_handle else 'None'}")
+        
         for task in session.tasks:
             if not task.done():
                 task.cancel()
         
         try:
             await session.session_cm.__aexit__(None, None, None)
+            logger.info("[CLEANUP] Session context manager closed successfully")
         except Exception as e:
-            logger.error(f"Error closing session: {e}")
+            logger.error(f"[CLEANUP] Error closing session: {e}")
+        
+        # Note: We preserve the session handle (_session_handle) for resumption
+        # It should NOT be cleared here as we need it for reconnection
+        logger.info(f"[CLEANUP] Session cleanup complete. Handle preserved: {self._session_handle[:20] if self._session_handle else 'None'}")
     
     async def aclose(self) -> None:
         """Clean up all resources"""
@@ -570,6 +632,8 @@ class GeminiRealtime(RealtimeBaseModel[GeminiEventTypes]):
                 logger.error(f"Error cleaning up audio track: {e}")
                 
         self._buffered_audio = bytearray()
+        # Clear the session handle on final close
+        self._session_handle = None
     
     async def _reconnect(self) -> None:
         if self._session:
